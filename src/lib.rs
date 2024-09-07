@@ -142,6 +142,8 @@ pub struct Player {
     pub duration_ms: i64,
     /// The framerate of the video stream, in frames per second.
     pub framerate: f64,
+    /// The accuracy to use when seeking. Smaller values are more accurate but consume more CPU
+    pub seek_tolerance_ms: u64,
     /// Configures certain aspects of this [`Player`].
     pub options: PlayerOptions,
     audio_stream_info: (usize, usize),
@@ -262,11 +264,6 @@ fn millisec_to_timestamp(millisec: i64, time_base: Rational) -> i64 {
     millisec.rescale(MILLISEC_TIME_BASE, time_base)
 }
 
-#[inline(always)]
-fn millisec_approx_eq(a: i64, b: i64) -> bool {
-    a.abs_diff(b) < 50
-}
-
 impl Player {
     /// A formatted string for displaying the duration of the video stream.
     pub fn duration_text(&mut self) -> String {
@@ -341,21 +338,22 @@ impl Player {
 
             self.last_seek_ms = Some((seek_frac as f64 * self.duration_ms as f64) as i64);
             self.set_state(PlayerState::Seeking(true));
+            let seek_tolerance_ms = self.seek_tolerance_ms;
 
             if let Some(audio_streamer) = audio_streamer.take() {
                 std::thread::spawn(move || {
-                    audio_streamer.lock().seek(seek_frac);
+                    audio_streamer.lock().seek(seek_frac, seek_tolerance_ms);
                 });
             };
             if let Some(subtitle_streamer) = subtitle_streamer.take() {
                 self.current_subtitles.clear();
                 std::thread::spawn(move || {
                     subtitle_queue.lock().clear();
-                    subtitle_streamer.lock().seek(seek_frac);
+                    subtitle_streamer.lock().seek(seek_frac, seek_tolerance_ms);
                 });
             };
             std::thread::spawn(move || {
-                video_streamer.lock().seek(seek_frac);
+                video_streamer.lock().seek(seek_frac, seek_tolerance_ms);
             });
         }
     }
@@ -826,8 +824,8 @@ impl Player {
                     .clicked()
                 {
                     match stream_type {
-                        Type::Audio => self.cycle_audio_stream(),
-                        Type::Subtitle => self.cycle_subtitle_stream(),
+                        Type::Audio => self.cycle_audio_stream(self.seek_tolerance_ms),
+                        Type::Subtitle => self.cycle_subtitle_stream(self.seek_tolerance_ms),
                         _ => unreachable!(),
                     };
                 };
@@ -1036,26 +1034,26 @@ impl Player {
         Ok(())
     }
 
-    fn cycle_stream<T: Streamer + 'static>(&self, mut streamer: Option<&Arc<Mutex<T>>>) {
+    fn cycle_stream<T: Streamer + 'static>(&self, mut streamer: Option<&Arc<Mutex<T>>>, seek_tolerance_ms: u64) {
         if let Some(streamer) = streamer.take() {
             let message_sender = self.message_sender.clone();
             let streamer = streamer.clone();
             std::thread::spawn(move || {
                 let mut streamer = streamer.lock();
-                streamer.cycle_stream();
+                streamer.cycle_stream(seek_tolerance_ms);
                 message_sender.send(PlayerMessage::StreamCycled(streamer.stream_type()))
             });
         };
     }
 
     /// Switches to the next subtitle stream.
-    pub fn cycle_subtitle_stream(&mut self) {
-        self.cycle_stream(self.subtitle_streamer.as_ref());
+    pub fn cycle_subtitle_stream(&mut self, seek_tolerance_ms: u64) {
+        self.cycle_stream(self.subtitle_streamer.as_ref(), seek_tolerance_ms);
     }
 
     /// Switches to the next audio stream.
-    pub fn cycle_audio_stream(&mut self) {
-        self.cycle_stream(self.audio_streamer.as_ref());
+    pub fn cycle_audio_stream(&mut self, seek_tolerance_ms: u64) {
+        self.cycle_stream(self.audio_streamer.as_ref(), seek_tolerance_ms);
     }
 
     /// Enables using [`Player::add_audio`] with the builder pattern.
@@ -1115,6 +1113,7 @@ impl Player {
             subtitle_stream_info: (0, 0),
             audio_stream_info: (0, 0),
             framerate,
+            seek_tolerance_ms: 50,
             video_timer: Timer::new(),
             audio_timer: Timer::new(),
             subtitle_timer: Timer::new(),
@@ -1194,9 +1193,9 @@ pub trait Streamer: Send {
     /// The associated type after the frame is processed.
     type ProcessedFrame;
     /// Seek to a location within the stream.
-    fn seek(&mut self, seek_frac: f32) {
+    fn seek(&mut self, seek_frac: f32, tolerance_ms: u64) {
         let target_ms = (seek_frac as f64 * self.duration_ms() as f64) as i64;
-        let seek_completed = millisec_approx_eq(target_ms, self.elapsed_ms().get());
+        let seek_completed = target_ms.abs_diff(self.elapsed_ms().get()) < tolerance_ms;
         // stop seeking near target so we dont waste cpu cycles
         if !seek_completed {
             let elapsed_ms = self.elapsed_ms().clone();
@@ -1254,7 +1253,7 @@ pub trait Streamer: Send {
     /// The stream index.
     fn stream_index(&self) -> usize;
     /// Move to the next stream index, if possible, and return the new_stream_index.
-    fn cycle_stream(&mut self) -> usize;
+    fn cycle_stream(&mut self, seek_tolerance_ms: u64) -> usize;
     /// The elapsed time of this streamer, in milliseconds.
     fn elapsed_ms(&self) -> &Shared<i64>;
     /// The elapsed time of the primary streamer, in milliseconds.
@@ -1340,7 +1339,7 @@ impl Streamer for VideoStreamer {
     fn stream_index(&self) -> usize {
         self.video_stream_index
     }
-    fn cycle_stream(&mut self) -> usize {
+    fn cycle_stream(&mut self, _seek_tolerance_ms: u64) -> usize {
         0
     }
     fn decoder(&mut self) -> &mut ffmpeg::decoder::Opened {
@@ -1401,7 +1400,7 @@ impl Streamer for AudioStreamer {
     fn stream_index(&self) -> usize {
         self.audio_stream_indices[0]
     }
-    fn cycle_stream(&mut self) -> usize {
+    fn cycle_stream(&mut self, _seek_tolerance_ms: u64) -> usize {
         self.audio_stream_indices.rotate_right(1);
         let new_stream_index = self.stream_index();
         let new_decoder = get_decoder_from_stream_index(&self.input_context, new_stream_index)
@@ -1472,7 +1471,7 @@ impl Streamer for SubtitleStreamer {
     fn stream_index(&self) -> usize {
         self.subtitle_stream_indices[0]
     }
-    fn cycle_stream(&mut self) -> usize {
+    fn cycle_stream(&mut self, seek_tolerance_ms: u64) -> usize {
         self.subtitle_stream_indices.rotate_right(1);
         self.subtitle_decoder.flush();
         let new_stream_index = self.stream_index();
@@ -1483,7 +1482,7 @@ impl Streamer for SubtitleStreamer {
         self.next_packet = None;
         // bandaid: subtitle decoder is always ahead of video decoder, so we need to seek it back to the
         // video decoder's location in order so that we don't miss possible subtitles when switching streams
-        self.seek(self.primary_elapsed_ms().get() as f32 / self.duration_ms as f32);
+        self.seek(self.primary_elapsed_ms().get() as f32 / self.duration_ms as f32, seek_tolerance_ms);
         self.subtitles_queue.lock().clear();
         self.subtitle_decoder = new_decoder;
         new_stream_index
